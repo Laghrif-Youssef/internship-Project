@@ -6,6 +6,7 @@ from kafka import KafkaProducer
 import json
 import random
 import time
+from database import get_connection, get_cursor
 
 app = FastAPI()
 
@@ -38,16 +39,16 @@ TOPIC = "transactions"
 
 @app.get("/profile/{customer_id}")
 def get_profile(customer_id: int):
-
-    profile = customers.get(customer_id)
-
-    if profile is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Customer not found"
-        )
-
-    return profile
+    with get_connection() as conn:
+        with get_cursor(conn) as cur:
+            cur.execute(
+                "SELECT * FROM customers WHERE customer_id = %s",
+                (customer_id,)
+            )
+            row = cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return dict(row)
 
 # =====================================================
 # TRANSACTION GENERATION

@@ -1,121 +1,282 @@
 # agents/chat_agent.py
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent 5 — Chat Agent
+# Agent 5 — Chat Agent (Text-to-SQL version)
 #
-# Responsibility:
-#   • Standalone agent — NOT part of the fraud pipeline graph
-#   • Lets a human analyst ask questions in natural language about:
-#       - Past decisions ("why was customer 110 blocked?")
-#       - Recent BLOCK/REVIEW patterns ("how many transactions blocked today?")
-#       - A specific transaction ("explain audit_id abc123")
-#   • Reads from audit_log.jsonl and answers via Ollama
+# Flow:
+#   1. Analyst types a question in natural language
+#   2. LLM reads the DB schema and generates a PostgreSQL query
+#   3. Query is validated (read-only guard) and executed against the DB
+#   4. LLM receives the real query results and formats a human answer
 #
-# Usage (interactive):
-#   python agents/chat_agent.py
+# This means ALL answers come from real database queries — no guessing,
+# no limited 50-record window, no hallucinated counts.
 # ─────────────────────────────────────────────────────────────────────────────
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import json
+import re
 import ollama
-from datetime import datetime, timezone
+import psycopg2
 
-#from state import OLLAMA_MODEL
+from database import get_connection, get_cursor
 
-AUDIT_FILE = "audit_log.jsonl"
+OLLAMA_MODEL = "qwen3:8b"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Database schema — given to the LLM so it knows what tables/columns exist
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Audit loader ──────────────────────────────────────────────────────────────
+DB_SCHEMA = """
+PostgreSQL database with two tables:
 
-def _load_recent_audit(n: int = 30) -> list[dict]:
-    """Load the last N records from the audit log."""
-    try:
-        with open(AUDIT_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        records = [json.loads(l) for l in lines if l.strip()]
-        return records[-n:]
-    except FileNotFoundError:
-        return []
+TABLE: customers
+  customer_id   INTEGER PRIMARY KEY
+  avg_amount    NUMERIC       -- customer's average transaction amount
+  usual_country VARCHAR(5)    -- e.g. 'MA', 'FR', 'ES', 'DE'
+  usual_device  VARCHAR(20)   -- e.g. 'Android', 'iPhone', 'Web'
+  active_start  INTEGER       -- hour of day (0-23) when customer typically starts transacting, e.g. 7 means 7:00 AM
+  active_end    INTEGER       -- hour of day (0-23) when customer typically stops transacting, e.g. 20 means 8:00 PM
 
+TABLE: fraud_decisions
+  audit_id        VARCHAR(8)  PRIMARY KEY
+  created_at      TIMESTAMPTZ -- when the decision was made
+  customer_id     INTEGER     REFERENCES customers(customer_id)
+  amount          NUMERIC     -- transaction amount
+  country         VARCHAR(5)  -- country of the transaction
+  device          VARCHAR(20) -- device used
+  hour            INTEGER     -- hour of the transaction (0-23)
+  tx_last_hour    INTEGER     -- number of transactions in the last hour
+  amount_ratio    NUMERIC     -- amount / customer avg_amount
+  country_changed BOOLEAN     -- true if country != usual_country
+  device_changed  BOOLEAN     -- true if device != usual_device
+  outside_hours   BOOLEAN     -- true if transaction outside active window
+  ml_score        NUMERIC     -- Isolation Forest risk score (0-100)
+  shap_values     JSONB       -- per-feature SHAP contributions
+  llm_reasoning   TEXT        -- LLM explanation of the decision
+  top_signals     JSONB       -- list of top risk signals
+  final_decision  VARCHAR(10) -- 'BLOCK', 'REVIEW', or 'APPROVE'
+  action_taken    TEXT        -- human-readable description of action
 
-def _summarize_audit(records: list[dict]) -> str:
-    """
-    Produce a compact text summary of recent audit records
-    to fit inside the LLM context window.
-    """
-    if not records:
-        return "No audit records available yet."
+NOTES:
+  - final_decision values are exactly: 'BLOCK', 'REVIEW', 'APPROVE' (uppercase)
+  - shap_values and top_signals are JSONB arrays/objects
+  - Use fd as alias for fraud_decisions, c as alias for customers
+  - For date filtering: created_at is TIMESTAMPTZ, use NOW() and INTERVAL
+  - To get customer profile alongside a decision: JOIN customers c USING (customer_id)
+"""
 
-    lines = []
-    for r in records:
-        lines.append(
-            f"[{r['audit_id']}] "
-            f"customer={r['customer_id']} "
-            f"amount={r['transaction'].get('amount')} "
-            f"country={r['transaction'].get('country')} "
-            f"device={r['transaction'].get('device')} "
-            f"hour={r['transaction'].get('hour')} "
-            f"ml_score={r['ml_score']} "
-            f"decision={r['final_decision']} "
-            f"top_signals={r['top_signals']} "
-            f"reasoning=\"{r['llm_reasoning'][:120]}...\""
-        )
-    return "\n".join(lines)
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 1 — Generate SQL from the analyst's question
+# ─────────────────────────────────────────────────────────────────────────────
 
+SQL_PROMPT_TEMPLATE = """You are a PostgreSQL expert working for a bank fraud detection team.
 
-# ── Chat function ─────────────────────────────────────────────────────────────
-
-def chat(question: str) -> str:
-    """
-    Answer an analyst's question about recent fraud decisions.
-    """
-    records = _load_recent_audit(n=50)
-    audit_summary = _summarize_audit(records)
-
-    stats = {
-        "total": len(records),
-        "block":   sum(1 for r in records if r["final_decision"] == "BLOCK"),
-        "review":  sum(1 for r in records if r["final_decision"] == "REVIEW"),
-        "approve": sum(1 for r in records if r["final_decision"] == "APPROVE"),
-    }
-
-    prompt = f"""You are a fraud operations assistant at a bank.
-You have access to the last {stats['total']} processed transactions.
-
-SUMMARY STATISTICS:
-- BLOCK:   {stats['block']}
-- REVIEW:  {stats['review']}
-- APPROVE: {stats['approve']}
-
-RECENT AUDIT RECORDS (most recent last):
-{audit_summary}
+DATABASE SCHEMA:
+{schema}
 
 ANALYST QUESTION:
 {question}
 
-Answer clearly and concisely. Reference specific audit_ids, customer_ids, 
-or risk signals when relevant. If the question cannot be answered from the 
-available data, say so clearly.
+Generate a single valid PostgreSQL SELECT query to answer this question.
+
+RULES:
+- Only SELECT queries allowed — never INSERT, UPDATE, DELETE, DROP, or TRUNCATE
+- Use table aliases: fd for fraud_decisions, c for customers
+- Limit results to 100 rows maximum unless the question asks for counts/aggregates
+- For "recent" or "latest" without a specific time: use the last 24 hours
+- For questions about a specific customer: filter by customer_id
+- For questions about blocked/reviewed/approved: filter final_decision
+- Return ONLY the SQL query — no explanation, no markdown, no backticks
 """
 
-    try:
-        response = ollama.chat(
-            model="qwen3:8b",
-            messages=[{"role": "user", "content": prompt}],
-            options={"temperature": 0.2, "num_ctx": 6144},
+def _generate_sql(question: str) -> str:
+    """Ask the LLM to write a SQL query for the analyst's question."""
+
+    prompt = SQL_PROMPT_TEMPLATE.format(
+        schema=DB_SCHEMA,
+        question=question,
+    )
+
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": 0, "num_ctx": 4096},
+    )
+
+    raw = response["message"]["content"]
+
+    # Strip think tags (Qwen3), markdown fences, leading/trailing whitespace
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL)
+    raw = re.sub(r"```(?:sql)?|```", "", raw)
+    raw = raw.strip()
+
+    # Take only the first statement if the model generated multiple
+    if ";" in raw:
+        raw = raw.split(";")[0].strip()
+
+    return raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 2 — Validate and execute the SQL query
+# ─────────────────────────────────────────────────────────────────────────────
+
+FORBIDDEN = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOKE)\b",
+    re.IGNORECASE,
+)
+
+def _execute_query(sql: str) -> tuple[list[str], list[tuple]]:
+    """
+    Execute a read-only SQL query.
+    Returns (column_names, rows).
+    Raises ValueError if the query is not a SELECT or contains forbidden keywords.
+    """
+    # Safety guard: only allow SELECT queries
+    clean = sql.strip().upper()
+    if not clean.startswith("SELECT"):
+        raise ValueError(f"Only SELECT queries are allowed. Got: {sql[:60]}")
+
+    if FORBIDDEN.search(sql):
+        raise ValueError(f"Query contains forbidden keyword: {sql[:60]}")
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            columns = [desc[0] for desc in cur.description]
+            rows    = cur.fetchall()
+
+    return columns, rows
+
+
+def _format_results(columns: list[str], rows: list[tuple]) -> str:
+    """Format query results as a readable text table for the LLM."""
+    if not rows:
+        return "Query returned 0 rows."
+
+    # Convert rows to list of dicts
+    records = [dict(zip(columns, row)) for row in rows]
+
+    # For large result sets, summarize instead of listing everything
+    if len(records) > 20:
+        return (
+            f"Query returned {len(records)} rows. First 20:\n" +
+            json.dumps(records[:20], indent=2, default=str)
         )
-        return response["message"]["content"]
 
+    return json.dumps(records, indent=2, default=str)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Step 3 — Format the result into a human answer
+# ─────────────────────────────────────────────────────────────────────────────
+
+ANSWER_PROMPT_TEMPLATE = """You are a fraud operations assistant at a bank.
+
+IMPORTANT FIELD DEFINITIONS:
+- active_start and active_end are HOURS OF THE DAY (0-23), not months.
+  Example: active_start=7, active_end=20 means the customer is active from 7:00 AM to 8:00 PM.
+- amount and avg_amount are transaction amounts in the local currency.
+- ml_score is a risk score from 0 to 100 (higher = more suspicious).
+
+The analyst asked:
+"{question}"
+
+You ran this SQL query:
+{sql}
+
+The query returned:
+{results}
+
+Write a clear, concise answer to the analyst's question based on the query results.
+- Reference specific values from the results (customer IDs, amounts, decisions, etc.)
+- If the result is a count or aggregate, state it directly
+- If the result is empty, say so clearly
+- Keep the answer focused — do not add unsolicited information
+"""
+
+def _format_answer(question: str, sql: str, results_text: str) -> str:
+    """Ask the LLM to turn raw query results into a human-readable answer."""
+
+    prompt = ANSWER_PROMPT_TEMPLATE.format(
+        question=question,
+        sql=sql,
+        results=results_text,
+    )
+
+    response = ollama.chat(
+        model=OLLAMA_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        options={"temperature": 0.1, "num_ctx": 4096},
+    )
+
+    raw = response["message"]["content"]
+    raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+    return raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main chat function — orchestrates all 3 steps
+# ─────────────────────────────────────────────────────────────────────────────
+
+def chat(question: str) -> str:
+    """
+    Answer an analyst's question using Text-to-SQL:
+      1. Generate SQL from the question
+      2. Execute it against PostgreSQL
+      3. Format the result into a human answer
+    """
+
+    # ── Step 1: Generate SQL ─────────────────────────────────────────────────
+    try:
+        sql = _generate_sql(question)
+        print(f"\n[Chat] Generated SQL:\n  {sql}")
     except Exception as e:
-        return f"LLM unavailable: {e}"
+        return f"Failed to generate SQL query: {e}"
+
+    # ── Step 2: Execute ──────────────────────────────────────────────────────
+    try:
+        columns, rows = _execute_query(sql)
+        results_text  = _format_results(columns, rows)
+        print(f"[Chat] Query returned {len(rows)} row(s)")
+    except ValueError as e:
+        return f"Query rejected (security): {e}"
+    except Exception as e:
+        # If the SQL has a syntax error, tell the analyst and show the query
+        return (
+            f"Database error: {e}\n\n"
+            f"Generated query was:\n{sql}\n\n"
+            "Please rephrase your question."
+        )
+
+    # ── Step 3: Format answer ─────────────────────────────────────────────────
+    try:
+        answer = _format_answer(question, sql, results_text)
+        return answer
+    except Exception as e:
+        # If formatting fails, return raw results as fallback
+        return f"Query succeeded but formatting failed ({e}).\n\nRaw results:\n{results_text}"
 
 
-# ── Interactive CLI ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Interactive CLI
+# ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
 
     print("=" * 70)
-    print("Fraud Chat Agent — ask questions about recent transactions")
-    print("Type 'exit' to quit")
+    print("Fraud Chat Agent — Text-to-SQL")
+    print("Ask questions about transactions and fraud decisions.")
+    print("Type 'exit' to quit.")
     print("=" * 70)
+    print("\nExample questions:")
+    print("  - How many transactions were blocked today?")
+    print("  - What is the profile of customer 3528?")
+    print("  - Show me the last 5 blocked transactions")
+    print("  - Which customer had the highest risk score?")
+    print("  - How many transactions had country_changed = true?")
+    print("  - What was the average ml_score for BLOCK decisions?")
 
     while True:
         try:
@@ -130,6 +291,5 @@ if __name__ == "__main__":
         if not question:
             continue
 
-        print("\nAgent: ", end="", flush=True)
         answer = chat(question)
-        print(answer)
+        print(f"\nAgent: {answer}")

@@ -19,6 +19,7 @@ import uuid
 from datetime import datetime, timezone
 
 from state import FraudState
+from database import get_connection
 
 AUDIT_FILE = "audit_log.jsonl"
 
@@ -53,28 +54,42 @@ def _action_approve(transaction: dict) -> str:
 # ── Audit logger ──────────────────────────────────────────────────────────────
 
 def _write_audit(state: FraudState, audit_id: str) -> None:
-    """
-    Append one line to audit_log.jsonl.
-    Each line is a self-contained JSON record — easy to tail, grep, or import.
-    """
-    record = {
-        "audit_id":       audit_id,
-        "timestamp":      datetime.now(timezone.utc).isoformat(),
-        "customer_id":    state["transaction"]["customer_id"],
-        "transaction":    state["transaction"],
-        "profile":        state["profile"],
-        "features":       state["features"],
-        "ml_score":       state["ml_score"],
-        "shap_values":    state["shap_values"],
-        "llm_reasoning":  state["llm_reasoning"],
-        "top_signals":    state["top_signals"],
-        "final_decision": state["final_decision"],
-        "action_taken":   state.get("action_taken", ""),
-    }
+    import json
+    tx   = state["transaction"]
+    feat = state["features"]
 
-    with open(AUDIT_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    sql = """
+        INSERT INTO fraud_decisions (
+            audit_id, customer_id,
+            amount, country, device, hour, tx_last_hour,
+            amount_ratio, country_changed, device_changed, outside_hours,
+            ml_score, shap_values,
+            llm_reasoning, top_signals, final_decision, action_taken
+        ) VALUES (
+            %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s
+        )
+    """
+    values = (
+        audit_id,
+        tx["customer_id"],
+        tx["amount"], tx["country"], tx["device"],
+        tx["hour"], tx.get("tx_last_hour", 1),
+        feat["amount_ratio"], bool(feat["country_changed"]),
+        bool(feat["device_changed"]), bool(feat["outside_hours"]),
+        state["ml_score"],
+        json.dumps(state["shap_values"]),
+        state["llm_reasoning"],
+        json.dumps(state["top_signals"]),
+        state["final_decision"],
+        state.get("action_taken", ""),
+    )
 
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, values)
+        conn.commit()
 
 # ── Agent node ────────────────────────────────────────────────────────────────
 
