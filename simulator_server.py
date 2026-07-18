@@ -14,13 +14,7 @@ app = FastAPI()
 # CUSTOMER PROFILES
 # =====================================================
 
-with open("customers.json", "r") as f:
-    customers = json.load(f)
-    
-customers = {
-    int(k): v
-    for k, v in customers.items()
-}
+
 
 # =====================================================
 # KAFKA PRODUCER
@@ -32,6 +26,43 @@ producer = KafkaProducer(
 )
 
 TOPIC = "transactions"
+
+# =====================================================
+# LOAD CUSTOMERS FROM DATABASE
+# =====================================================
+
+def load_customers():
+
+    with get_connection() as conn:
+        with get_cursor(conn) as cur:
+
+            cur.execute("""
+                SELECT *
+                FROM customers
+            """)
+
+            rows = cur.fetchall()
+
+    customers = {}
+
+    for row in rows:
+
+        customer = dict(row)
+
+        customer["avg_amount"] = float(
+            customer["avg_amount"]
+        )
+
+        customers[customer["customer_id"]] = customer
+
+    return customers
+
+
+customers = load_customers()
+
+print(f"Loaded {len(customers)} customer profiles.")
+
+
 
 # =====================================================
 # PROFILE API
@@ -170,7 +201,7 @@ def transaction_loop():
             f"Sent transaction: {transaction}"
         )
 
-        time.sleep(8)
+        time.sleep(15)
 
 # =====================================================
 # STARTUP
